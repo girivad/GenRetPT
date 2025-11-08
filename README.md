@@ -1,3 +1,7 @@
+# Pause Tokens for Precise and Performant Generative Retrieval
+
+This repository is a fork of the GenRet paper; we replicate the checkpoints/metrics on NQ320K and experiment with Pause Tokens with this method as our base architecture.
+
 # Learning to Tokenize for Generative Retrieval
 
 Code of the paper [Learning to Tokenize for Generative Retrieval](https://openreview.net/pdf?id=UKd6dpVGdu).
