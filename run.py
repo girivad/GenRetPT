@@ -9,7 +9,7 @@ from accelerate import Accelerator
 from torch.utils.data import Dataset
 from transformers import TrainingArguments, Trainer
 from transformers.trainer_pt_utils import get_parameter_names
-from transformers.generation_utils import GenerationMixin
+from transformers.generation import GenerationMixin
 from torch import nn, Tensor
 import torch.distributed as dist
 from typing import Optional, Union, List, Dict, Any, Tuple
