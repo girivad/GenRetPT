@@ -4,5 +4,7 @@ accelerate
 tqdm 
 numpy 
 faiss-cpu 
+faiss-gpu
 numpy==1.26.4 
 k-means-constrained
+wandb

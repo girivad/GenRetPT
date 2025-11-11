@@ -75,25 +75,25 @@ class QuantizeOutput(ModelOutput):
 def sinkhorn_algorithm(out: Tensor, epsilon: float,
                        sinkhorn_iterations: int,
                        use_distrib_train: bool):
-    Q = torch.exp(out / epsilon)  # Q is M-K-by-B
+    Q = torch.exp(out / epsilon)  # Q is M-K-by-B (SxVxB)
 
     M = Q.shape[0]
-    B = Q.shape[2]  # number of samples to assign
     K = Q.shape[1]  # how many centroids per block (usually set to 256)
+    B = Q.shape[2]  # number of samples to assign
 
     # make the matrix sums to 1
-    sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
+    sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True) # normalizing each position in the doc id across possible tokens and samples in the batch.
     if use_distrib_train:
         B *= dist.get_world_size()
         dist.all_reduce(sum_Q)
     Q /= sum_Q
     for it in range(sinkhorn_iterations):
         # normalize each row: total weight per prototype must be 1/K
-        sum_of_rows = torch.sum(Q, dim=2, keepdim=True)
+        sum_of_rows = torch.sum(Q, dim=2, keepdim=True) # M x K; sum of exp(H_norm / eps) along batch dimension, per position and possible token.
         if use_distrib_train:
             dist.all_reduce(sum_of_rows)
-        Q /= sum_of_rows
-        Q /= K
+        Q /= sum_of_rows # MxKxB (normalized across batch dimension)
+        Q /= K # MxKxB (each MxK is given 1/K weight instead of 1)
 
         # normalize each column: total weight per sample must be 1/B
         Q /= torch.sum(Q, dim=1, keepdim=True)
@@ -106,6 +106,15 @@ def sinkhorn_algorithm(out: Tensor, epsilon: float,
 def sinkhorn_raw(out: Tensor, epsilon: float,
                  sinkhorn_iterations: int,
                  use_distrib_train: bool):
+    """
+    Arguments:
+
+        - out: K x B
+    
+    Returns:
+
+        - Q: K x B
+    """
     Q = torch.exp(out / epsilon).t()  # Q is K-by-B for consistency with notations from our paper
 
     B = Q.shape[1]
@@ -131,6 +140,11 @@ def sinkhorn_raw(out: Tensor, epsilon: float,
 
 
 def get_optimizer(model, lr):
+    """
+    Creates optimizer for the model with (no?) weight decay. 
+
+    Centroids are learned with 20x learning rate.
+    """
     decay_parameters = get_parameter_names(model, [nn.LayerNorm])
     decay_parameters = [name for name in decay_parameters if "bias" not in name]
     optimizer_grouped_parameters = [
@@ -171,16 +185,16 @@ class Model(nn.Module, GenerationMixin, ABC):
         self.use_constraint, self.sk_epsilon, self.sk_iters = use_constraint, sk_epsilon, sk_iters
 
         # Codebook of each time step
-        self.centroids = nn.ModuleList([nn.Linear(hidden_size, code_number, bias=False) for _ in range(code_length)])
+        self.centroids = nn.ModuleList([nn.Linear(hidden_size, code_number, bias=False) for _ in range(code_length)]) # M x D x K (M different codebooks, one per timestep)
         self.centroids.requires_grad_(True)
 
         # Code embedding (input to the decoder)
-        self.code_embedding = nn.ModuleList([nn.Embedding(code_number, hidden_size) for _ in range(code_length)])
+        self.code_embedding = nn.ModuleList([nn.Embedding(code_number, hidden_size) for _ in range(code_length)]) # M x D x K (embeds the prior code tokens for the decoder to generate d_t or q_t in the paper)
         self.code_embedding.requires_grad_(True)
 
-        self.code_length = code_length
-        self.zero_inp = zero_inp
-        self.code_number = code_number
+        self.code_length = code_length # M
+        self.zero_inp = zero_inp 
+        self.code_number = code_number # K
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, encoder_outputs=None, **kwargs):
         return {"decoder_input_ids": input_ids, "encoder_outputs": encoder_outputs, "attention_mask": attention_mask}
@@ -263,15 +277,15 @@ class Model(nn.Module, GenerationMixin, ABC):
     def forward(self, input_ids=None, attention_mask=None, decoder_input_ids=None, aux_ids=None, return_code=False,
                 return_quantized_embedding=False, use_constraint=None, encoder_outputs=None, **kwargs):
         if decoder_input_ids is None or self.zero_inp:
-            decoder_input_ids = torch.zeros(input_ids.size(0), self.code_length).long().to(input_ids.device)
+            decoder_input_ids = torch.zeros(input_ids.size(0), self.code_length).long().to(input_ids.device) # BxM, These are the z_{<t} tokens, vs input_ids (which are the normally tokenized representation of the document/query text).
 
         # decoder_inputs_embeds = self.code_embedding(decoder_input_ids)
 
         decoder_inputs_embeds = []
-        for i in range(min(decoder_input_ids.size(1), len(self.code_embedding))):
-            code_embedding = self.code_embedding[i]
-            decoder_inputs_embeds.append(code_embedding(decoder_input_ids[:, i]))
-        decoder_inputs_embeds = torch.stack(decoder_inputs_embeds, dim=1)
+        for i in range(min(decoder_input_ids.size(1), len(self.code_embedding))): # for i in range(min(t, M))
+            code_embedding = self.code_embedding[i] # Retrieve the embedding for timestep i (not the same as E_i, which is the learned codebook)
+            decoder_inputs_embeds.append(code_embedding(decoder_input_ids[:, i])) # B x D (embedding of the ith code token)
+        decoder_inputs_embeds = torch.stack(decoder_inputs_embeds, dim=1) # BxMxD
 
         model_outputs = self.model(
             input_ids=input_ids,
@@ -696,13 +710,14 @@ def train(config):
     epoch_step = len(data_loader) // in_batch_size
     # safe_save(accelerator, model, save_path, -1, end_epoch=end_epoch)
     last_checkpoint = None
-
+    print("Epochs:", epochs)
     for _ in range(epochs):
         accelerator.print(f'Training {save_path} {epoch}')
         accelerator.wait_for_everyone()
         model.train()
         tk0 = tqdm(data_loader, total=len(data_loader))
         loss_report = []
+        print("Batch Dataloading within each Epoch:")
         for batch in tk0:
             step += 1
             with accelerator.accumulate(model):
@@ -724,6 +739,10 @@ def train(config):
                                                        last_checkpoint=last_checkpoint)
                 if epoch >= end_epoch:
                     break
+            
+            if step > 15:
+                break
+
         if in_batch_size == 1:
             epoch = safe_save(accelerator, model, save_path, epoch, end_epoch=end_epoch, save_step=save_step)
 
@@ -1145,12 +1164,14 @@ def main():
 
     checkpoint = None
 
-    for loop in range(args.max_length):
+    for loop in range(args.max_length): # Progressive Training
         config['save_path'] = args.save_path + f'-{loop + 1}-pre'
         config['code_length'] = loop + 1
         config['prev_model'] = checkpoint
         config['prev_id'] = f'{checkpoint}.code' if checkpoint is not None else None
-        config['epochs'] = 1 if loop == 0 else 10
+        config['epochs'] = 1 if loop == 0 else 10 # Do 1 epoch for 
+        print("Code Length:", loop + 1)
+        print("Epochs:", config["epochs"])
         config['loss_w'] = 1
         checkpoint = train(config)
         test_dr(config)
